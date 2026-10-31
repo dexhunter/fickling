@@ -537,8 +537,9 @@ class Opcode:
                 raise ValueError(f"You must provide an `info` argument to construct {cls.__name__}")
             info = kwargs["info"]
             if info.name in OPCODES_BY_NAME:
-                del kwargs["info"]
-                return OPCODES_BY_NAME[info.name](*args, **kwargs)
+                # Python runs __init__ (with the original arguments) on the returned instance,
+                # so only allocate it here to avoid initializing every opcode twice.
+                return super().__new__(OPCODES_BY_NAME[info.name])
             raise NotImplementedError(f"TODO: Add support for Opcode {info.name}")
         return super().__new__(cls)
 
@@ -1217,10 +1218,7 @@ class Pickled(OpcodeSequence):
             on by default. Pass False to emit each opcode's bytes verbatim, which preserves the
             input exactly even when its frames are inconsistent.
         """
-        b = bytearray()
-        for chunk in self._output_chunks(reframe):
-            b.extend(chunk)
-        return bytes(b)
+        return b"".join(self._output_chunks(reframe))
 
     def dump(self, file: BinaryIO, reframe: bool = True):
         """Serialize the opcode sequence to `file`. See `dumps()` for `reframe`."""
@@ -1336,38 +1334,55 @@ class Pickled(OpcodeSequence):
         first_pos = pickled.tell()
         opcodes: List[Opcode] = []
         has_invalid_opcode = False
+        # The last opcode whose bytes are only known once the next opcode starts
+        pending: Opcode | None = None
+
+        if type(pickled) is BytesIO:
+            # Slice the underlying bytes rather than seeking back and forth for every opcode
+            buffer = pickled.getvalue()
+
+            def read(start: int, stop: int) -> bytes:
+                return buffer[start:stop]
+
+        else:
+
+            def read(start: int, stop: int) -> bytes:
+                resume = pickled.tell()
+                pickled.seek(start)
+                try:
+                    return pickled.read(stop - start)
+                finally:
+                    # Need to reset the position within the file so as not to confuse genops
+                    pickled.seek(resume)
 
         try:
             for info, arg, pos in genops(pickled):
-                pos_before = pickled.tell()
-                try:
-                    if (
-                        pos is not None
-                        and opcodes
-                        and opcodes[-1].pos is not None
-                        and not opcodes[-1].has_data()
-                        and opcodes[-1].pos < pos
-                    ):
-                        pickled.seek(opcodes[-1].pos)
-                        opcodes[-1].data = pickled.read(pos - opcodes[-1].pos)
-                    if pos is not None:
-                        pickled.seek(pos)
-                    if info.arg is None or info.arg.n == 0:
-                        data = info.code.encode("utf-8") if pos is None else None
-                    elif info.arg.n > 0 and pos is not None:
-                        data = pickled.read(len(info.code) + info.arg.n)
-                        if len(data) != len(info.code) + info.arg.n:
-                            raise PickleDecodeError(
-                                f"Error decoding opcode {info.name} at offset {pos}: "
-                                f"Expected {len(info.code) + info.arg.n} bytes of data but only "
-                                f"read {len(data)}"
-                            )
-                    else:
-                        data = None
-                    opcodes.append(Opcode(info=info, argument=arg, data=data, position=pos))
-                finally:
-                    # Need to reset the position within the file so as not to confuse genops
-                    pickled.seek(pos_before)
+                if pending is not None and pos is not None and pending.pos < pos:
+                    pending._data = read(pending.pos, pos)
+                pending = None
+                arg_info = info.arg
+                if arg_info is None or arg_info.n == 0:
+                    data = info.code.encode("utf-8") if pos is None else None
+                elif arg_info.n > 0 and pos is not None:
+                    size = len(info.code) + arg_info.n
+                    data = read(pos, pos + size)
+                    if len(data) != size:
+                        raise PickleDecodeError(
+                            f"Error decoding opcode {info.name} at offset {pos}: "
+                            f"Expected {size} bytes of data but only read {len(data)}"
+                        )
+                else:
+                    data = None
+                opcode_class = OPCODES_BY_NAME.get(info.name)
+                if opcode_class is None:
+                    # Let the generic constructor report the unsupported opcode
+                    opcode = Opcode(info=info, argument=arg, data=data, position=pos)
+                else:
+                    # The class already carries `info`, so skip the dispatch through Opcode
+                    opcode = opcode_class(arg, pos, data)
+                opcodes.append(opcode)
+                if data is None and pos is not None:
+                    pending = opcode
         except ValueError as e:
             if opcodes:
                 if fail_on_decode_error:
